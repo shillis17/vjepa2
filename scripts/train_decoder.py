@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 
-from dataset import UltrasoundFrames
+from dataset import UltrasoundFrames, file_digest
 from vjepa2_decoder.models.vit_decoder import ViTDecoder
 
 
@@ -552,6 +552,7 @@ def read_manifest(
 def cache_is_complete(
     directory,
     expected_samples,
+    identity,
 ):
     directory = Path(
         directory
@@ -562,6 +563,14 @@ def cache_is_complete(
     )
 
     if manifest is None:
+        return False
+    if manifest.get("identity") != identity:
+        return False
+    for name, digest in manifest.get("shard_digests", {}).items():
+        path = directory / name
+        if not path.is_file() or file_digest(path) != digest:
+            return False
+    if len(manifest.get("shard_digests", {})) != manifest.get("shards"):
         return False
 
     if (
@@ -608,6 +617,11 @@ def cache_split(
         / split_name
     )
 
+    identity = dict(dataset=dataset.fingerprint, model=config,
+                    encoder_sha256=file_digest(checkpoint_path_for(model_key, args.checkpoint_dir)),
+                    cache_dtype=args.cache_dtype, target_dtype="float16",
+                    mixing="global-random-training-shards-v1", cache_batch_size=args.cache_batch_size,
+                    source_sha256=file_digest(Path(args.vjepa_repo) / "src/hub/backbones.py"))
     if (
         args.rebuild_cache
         and cache_dir.exists()
@@ -619,6 +633,7 @@ def cache_split(
     if cache_is_complete(
         cache_dir,
         len(dataset),
+        identity,
     ):
         manifest = read_manifest(
             cache_dir
@@ -680,7 +695,8 @@ def cache_split(
         batch_size=(
             args.cache_batch_size
         ),
-        shuffle=False,
+        shuffle=(split_name == "train"),
+        generator=torch.Generator().manual_seed(42),
         num_workers=(
             args.num_workers
         ),
@@ -910,7 +926,9 @@ def cache_split(
             )
 
     manifest = {
-        "format_version": 2,
+        "format_version": 3,
+        "identity": identity,
+        "shard_digests": {p.name: file_digest(p) for p in sorted(cache_dir.glob("shard_*.pt"))},
         "model": model_key,
         "split": split_name,
         "samples": sample_count,
@@ -1514,7 +1532,7 @@ def report_progress(split, epoch, batch, batches, count, started, loss, device):
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
     print(f"{split} epoch={epoch} batch={batch}/{batches} mse={loss:.6f} | "
-          f"{count / max(elapsed, 1e-9):.2f} frames/s "
+          f"{batch / max(elapsed, 1e-9):.2f} batches/s | {count / max(elapsed, 1e-9):.2f} frames/s | "
           f"{elapsed / batch:.3f} s/batch elapsed={elapsed:.1f}s", flush=True)
 
 
@@ -1669,6 +1687,9 @@ def train_decoder(
         output
         / "best_decoder.pt"
     )
+    if latest_path.exists() and not args.resume:
+        raise FileExistsError(f"Existing run: {output}. Use a new output directory or --resume.")
+
 
     train_cache = (
         ShardedFeatureCache(
@@ -1798,6 +1819,10 @@ def train_decoder(
             map_location="cpu",
             weights_only=True,
         )
+
+        current_identities = [read_manifest(train_cache_dir)["identity"], read_manifest(val_cache_dir)["identity"]]
+        if checkpoint.get("data_identities") != current_identities:
+            raise ValueError("Resume data/cache identity changed. Use a new output directory for the filtered dataset.")
 
         decoder.load_state_dict(
             checkpoint[
@@ -2107,6 +2132,7 @@ def train_decoder(
             log_file.flush()
 
             checkpoint = {
+                "data_identities": [read_manifest(train_cache_dir)["identity"], read_manifest(val_cache_dir)["identity"]],
                 "model_key": (
                     model_key
                 ),
@@ -2579,7 +2605,7 @@ def main():
     parser.add_argument(
         "--frame-stride",
         type=int,
-        default=15,
+        default=1,
     )
 
     parser.add_argument(
@@ -2653,7 +2679,13 @@ def main():
         action="store_true",
     )
 
+    parser.add_argument("--gray-threshold", type=int, default=32)
+    parser.add_argument("--min-gray-fraction", type=float, default=0.02)
+    parser.add_argument("--manifest-dir", type=Path, default=Path("../outputs/frame_manifests"))
     args = parser.parse_args()
+    if args.frame_stride < 1 or not 1 <= args.gray_threshold <= 255 or not 0 <= args.min_gray_fraction <= 1:
+        parser.error("Invalid frame stride or image quality thresholds")
+
 
     # ========================================================
     # Model selection
@@ -2756,6 +2788,9 @@ def main():
         frame_stride=(
             args.frame_stride
         ),
+        manifest_path=args.manifest_dir / "train.json",
+        gray_threshold=args.gray_threshold,
+        min_gray_fraction=args.min_gray_fraction,
     )
 
     val_dataset = UltrasoundFrames(
@@ -2763,6 +2798,9 @@ def main():
         frame_stride=(
             args.frame_stride
         ),
+        manifest_path=args.manifest_dir / "val.json",
+        gray_threshold=args.gray_threshold,
+        min_gray_fraction=args.min_gray_fraction,
     )
 
     test_dataset = UltrasoundFrames(
@@ -2770,6 +2808,9 @@ def main():
         frame_stride=(
             args.frame_stride
         ),
+        manifest_path=args.manifest_dir / "test.json",
+        gray_threshold=args.gray_threshold,
+        min_gray_fraction=args.min_gray_fraction,
     )
 
     if len(
