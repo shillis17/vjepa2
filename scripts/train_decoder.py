@@ -5,6 +5,7 @@ import gc
 import json
 import random
 import shutil
+import time
 from pathlib import Path
 
 import torch
@@ -1508,18 +1509,34 @@ def save_preview_grid(
 # Evaluation
 # ============================================================
 
+def report_progress(split, epoch, batch, batches, count, started, loss, device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    print(f"{split} epoch={epoch} batch={batch}/{batches} mse={loss:.6f} | "
+          f"{count / max(elapsed, 1e-9):.2f} frames/s "
+          f"{elapsed / batch:.3f} s/batch elapsed={elapsed:.1f}s", flush=True)
+
+
 def evaluate_decoder(
     decoder,
     cache,
     args,
     device,
     bf16_supported,
+    split="val",
+    epoch=0,
 ):
     decoder.eval()
 
     native_total = 0.0
     common_total = 0.0
     count = 0
+    batch_index = 0
+    batches = (len(cache) + args.batch_size - 1) // args.batch_size
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
 
     with torch.no_grad():
 
@@ -1606,6 +1623,9 @@ def evaluate_decoder(
             )
 
             count += current
+            batch_index += 1
+            if batch_index == 1 or batch_index % args.log_every == 0 or batch_index == batches:
+                report_progress(split, epoch, batch_index, batches, count, started, native_loss.item(), device)
 
     return (
         native_total
@@ -1894,6 +1914,10 @@ def train_decoder(
             total = 0.0
             count = 0
             batch_index = 0
+            batches = (len(train_cache) + args.batch_size - 1) // args.batch_size
+            if decoder_device.type == "cuda":
+                torch.cuda.synchronize(decoder_device)
+            started = time.perf_counter()
 
             for (
                 features,
@@ -1989,28 +2013,12 @@ def train_decoder(
 
                 if (
                     batch_index == 1
-                    or global_step
-                    % args.log_every
-                    == 0
+                    or batch_index % args.log_every == 0
+                    or batch_index == batches
                 ):
 
-                    print(
-                        f"{model_key} | "
-                        f"Epoch "
-                        f"{epoch_number}/"
-                        f"{args.epochs} | "
-                        f"Batch "
-                        f"{batch_index} | "
-                        f"Step "
-                        f"{global_step} | "
-                        f"BatchSize "
-                        f"{current} | "
-                        f"MSE "
-                        f"{loss.item():.6f} | "
-                        f"GradNorm "
-                        f"{grad_norm.item():.6f}",
-                        flush=True,
-                    )
+                    report_progress("train", epoch_number, batch_index, batches,
+                                    count, started, loss.item(), decoder_device)
 
                     writer.writerow(
                         [
@@ -2037,6 +2045,7 @@ def train_decoder(
                     args,
                     decoder_device,
                     bf16_supported,
+                    epoch=epoch_number,
                 )
             )
 
@@ -2072,12 +2081,6 @@ def train_decoder(
                 flush=True,
             )
 
-            print_gpu_memory(
-                f"after "
-                f"{model_key} "
-                f"epoch "
-                f"{epoch_number}"
-            )
 
             writer.writerow(
                 [
@@ -2204,6 +2207,11 @@ def train_decoder(
                 bf16_supported,
             )
 
+            peak = (f"{torch.cuda.max_memory_allocated(decoder_device) / 1024**3:.2f} GiB"
+                    if decoder_device.type == "cuda" else "n/a (CPU)")
+            print(f"Epoch {epoch_number}: train={train_mse:.6f} val={val_mse:.6f} "
+                  f"common256={val_common:.6f} | max_gpu_memory={peak}", flush=True)
+
     return (
         decoder,
         best_path,
@@ -2283,6 +2291,7 @@ def evaluate_test(
             args,
             decoder_device,
             bf16_supported,
+            split="test",
         )
     )
 
